@@ -42,14 +42,17 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
     private static final long PRUNE_INTERVAL_TICKS = 5L * 60 * 20;
     private static final int FRAME_SIZE = 6;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss");
-    private static final String GUI_TITLE = "§6Hit Replays";
 
     private final Map<UUID, float[]> bufferData = new HashMap<>();
     private final Map<UUID, Integer> bufferHead = new HashMap<>();
     private final Map<UUID, Integer> bufferCount = new HashMap<>();
     private final Map<UUID, String> bufferWorld = new HashMap<>();
     private final List<HitRecord> allHits = new ArrayList<>();
-    private final Map<UUID, List<HitRecord>> openGuis = new HashMap<>();
+
+    // Key: viewer UUID, Value: the inventory we opened for them
+    private final Map<UUID, Inventory> openGuis = new HashMap<>();
+    private final Map<UUID, List<HitRecord>> guiHits = new HashMap<>();
+
     private final Map<UUID, BukkitTask> viewerTasks = new HashMap<>();
     private final Map<UUID, GameMode> viewerPrevMode = new HashMap<>();
     private final Map<UUID, Location> viewerPrevLoc = new HashMap<>();
@@ -119,8 +122,7 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         buf[head * FRAME_SIZE + 4] = loc.getPitch();
         buf[head * FRAME_SIZE + 5] = (float) p.getHealth();
         bufferWorld.put(id, loc.getWorld().getName());
-        int next = (head + 1) % BUFFER_FRAMES;
-        bufferHead.put(id, next);
+        bufferHead.put(id, (head + 1) % BUFFER_FRAMES);
         int count = bufferCount.get(id);
         if (count < BUFFER_FRAMES) bufferCount.put(id, count + 1);
     }
@@ -133,8 +135,7 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         float[] out = new float[count * FRAME_SIZE];
         int start = (head - count + BUFFER_FRAMES) % BUFFER_FRAMES;
         for (int i = 0; i < count; i++) {
-            int src = ((start + i) % BUFFER_FRAMES) * FRAME_SIZE;
-            System.arraycopy(buf, src, out, i * FRAME_SIZE, FRAME_SIZE);
+            System.arraycopy(buf, ((start + i) % BUFFER_FRAMES) * FRAME_SIZE, out, i * FRAME_SIZE, FRAME_SIZE);
         }
         return out;
     }
@@ -214,18 +215,20 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
     }
 
     private void openGui(Player viewer, List<HitRecord> hits, String targetName) {
-        int rows = Math.min(6, Math.max(1, (int) Math.ceil(hits.size() / 9.0)));
-        Inventory inv = Bukkit.createInventory(null, rows * 9, GUI_TITLE + " — " + targetName);
-        for (int i = 0; i < Math.min(hits.size(), rows * 9); i++) {
+        int size = Math.min(54, (int) Math.ceil(hits.size() / 9.0) * 9);
+        if (size == 0) size = 9;
+        Inventory inv = Bukkit.createInventory(null, size, Component.text("HitReplay:" + viewer.getUniqueId()));
+
+        for (int i = 0; i < Math.min(hits.size(), size); i++) {
             HitRecord rec = hits.get(i);
             boolean isVictim = rec.victimName().equalsIgnoreCase(targetName);
             ItemStack item = new ItemStack(isVictim ? Material.RED_DYE : Material.LIME_DYE);
             ItemMeta meta = item.getItemMeta();
             String timeStr = TIME_FORMAT.format(new Date(rec.timestamp()));
             String opponent = isVictim ? rec.attackerName() : rec.victimName();
-            String role = isVictim ? "§cHit by " : "§aHit ";
+            String role = isVictim ? "Hit by " : "Hit ";
             int seconds = (rec.frameCount() * RECORD_INTERVAL_TICKS) / 20;
-            meta.displayName(Component.text(role + opponent + " at " + timeStr));
+            meta.displayName(Component.text("§6" + role + "§e" + opponent + " §fat " + timeStr));
             List<Component> lore = new ArrayList<>();
             lore.add(Component.text("§7Time: §f" + timeStr));
             lore.add(Component.text("§7Duration: §f" + seconds + "s"));
@@ -237,7 +240,9 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
             item.setItemMeta(meta);
             inv.setItem(i, item);
         }
-        openGuis.put(viewer.getUniqueId(), hits);
+
+        openGuis.put(viewer.getUniqueId(), inv);
+        guiHits.put(viewer.getUniqueId(), hits);
         viewer.openInventory(inv);
     }
 
@@ -245,20 +250,32 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
     public void onGuiClick(InventoryClickEvent event) {
         if (!(event.getWhoClicked() instanceof Player viewer)) return;
         if (event.getCurrentItem() == null) return;
-        if (!event.getView().title().toString().contains(GUI_TITLE)) return;
+
+        // Check if this inventory belongs to this viewer
+        Inventory tracked = openGuis.get(viewer.getUniqueId());
+        if (tracked == null) return;
+        if (!event.getInventory().equals(tracked)) return;
+
         event.setCancelled(true);
+
         int slot = event.getRawSlot();
-        List<HitRecord> hits = openGuis.get(viewer.getUniqueId());
+        List<HitRecord> hits = guiHits.get(viewer.getUniqueId());
         if (hits == null || slot < 0 || slot >= hits.size()) return;
+
+        HitRecord rec = hits.get(slot);
         viewer.closeInventory();
-        startReplay(viewer, hits.get(slot));
+        startReplay(viewer, rec);
     }
 
     @EventHandler
     public void onGuiClose(InventoryCloseEvent event) {
         if (!(event.getPlayer() instanceof Player viewer)) return;
-        if (!event.getView().title().toString().contains(GUI_TITLE)) return;
-        openGuis.remove(viewer.getUniqueId());
+        Inventory tracked = openGuis.get(viewer.getUniqueId());
+        if (tracked == null) return;
+        if (event.getInventory().equals(tracked)) {
+            openGuis.remove(viewer.getUniqueId());
+            guiHits.remove(viewer.getUniqueId());
+        }
     }
 
     private void startReplay(Player viewer, HitRecord rec) {
@@ -268,7 +285,11 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         viewer.setGameMode(GameMode.SPECTATOR);
 
         int frameCount = rec.frameCount();
-        if (frameCount == 0) { viewer.sendMessage("§cNo frames in replay."); restoreViewer(viewer); return; }
+        if (frameCount == 0) {
+            viewer.sendMessage("§cNo frames in replay.");
+            restoreViewer(viewer);
+            return;
+        }
 
         org.bukkit.World world = Bukkit.getWorld(rec.worldName());
         if (world == null) world = viewer.getWorld();
@@ -323,7 +344,11 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
 
     private void stopReplay(Player viewer) {
         BukkitTask t = viewerTasks.remove(viewer.getUniqueId());
-        if (t != null) { t.cancel(); restoreViewer(viewer); viewer.sendMessage("§6[HitReplay] §fReplay stopped."); }
+        if (t != null) {
+            t.cancel();
+            restoreViewer(viewer);
+            viewer.sendMessage("§6[HitReplay] §fReplay stopped.");
+        }
     }
 
     private void restoreViewer(Player viewer) {
