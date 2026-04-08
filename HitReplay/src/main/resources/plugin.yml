@@ -1,0 +1,16 @@
+name: HitReplay
+version: ${project.version}
+main: com.hitreplay.HitReplay
+api-version: '1.21'
+description: Records hits and lets ops replay them in-game
+
+commands:
+  replay:
+    description: Open hit replay GUI or stop watching
+    usage: /replay <player> | /replay stop
+    permission: hitreplay.admin
+
+permissions:
+  hitreplay.admin:
+    description: Access to replay commands
+    default: op
