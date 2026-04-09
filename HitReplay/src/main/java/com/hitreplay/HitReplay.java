@@ -25,11 +25,12 @@ import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -37,41 +38,72 @@ import java.util.UUID;
 
 public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
-    private static final int RECORD_INTERVAL = 1;
-    private static final int BUFFER_FRAMES = 300;
+    private static final int MAX_BUFFER = 300;
     private static final long MAX_HIT_AGE_MS = 15L * 60 * 60 * 1000;
     private static final long PRUNE_INTERVAL = 5L * 60 * 20;
-    private static final int FS = 6;
     private static final SimpleDateFormat FMT = new SimpleDateFormat("HH:mm:ss");
 
-    private final Map<UUID, float[]>  bufData  = new HashMap<>();
-    private final Map<UUID, Integer>  bufHead  = new HashMap<>();
-    private final Map<UUID, Integer>  bufCount = new HashMap<>();
-    private final Map<UUID, String>   bufWorld = new HashMap<>();
-    private final List<HitRecord>     allHits  = new ArrayList<>();
-    private final Map<UUID, Inventory>       openGuis = new HashMap<>();
-    private final Map<UUID, List<HitRecord>> guiHits  = new HashMap<>();
-    private final Map<UUID, ReplaySession>   sessions = new HashMap<>();
+    private final Map<UUID, Deque<Frame>> buffers = new HashMap<>();
+    private final List<HitRecord> allHits = new ArrayList<>();
+    private final Map<UUID, Inventory> openGuis = new HashMap<>();
+    private final Map<UUID, List<HitRecord>> guiHits = new HashMap<>();
+    private final Map<UUID, ReplaySession> sessions = new HashMap<>();
 
     private BukkitTask recordTask;
     private BukkitTask pruneTask;
 
-    record HitRecord(
-        long timestamp,
-        String victimName, UUID victimId,
-        String attackerName, UUID attackerId,
-        float[] victimFrames,
-        float[] attackerFrames,
-        String worldName,
-        int frameCount
-    ) {}
+    static class Frame {
+        final double x, y, z;
+        final float yaw, pitch, health;
+        final String world;
+
+        Frame(Player p) {
+            Location loc = p.getLocation();
+            this.x = loc.getX();
+            this.y = loc.getY();
+            this.z = loc.getZ();
+            this.yaw = loc.getYaw();
+            this.pitch = loc.getPitch();
+            this.health = (float) p.getHealth();
+            this.world = loc.getWorld().getName();
+        }
+
+        Location toLocation() {
+            org.bukkit.World w = Bukkit.getWorld(world);
+            if (w == null) w = Bukkit.getWorlds().get(0);
+            return new Location(w, x, y, z, yaw, pitch);
+        }
+    }
+
+    static class HitRecord {
+        final long timestamp;
+        final String victimName, attackerName;
+        final UUID victimId, attackerId;
+        final List<Frame> victimFrames, attackerFrames;
+
+        HitRecord(long timestamp,
+                  String victimName, UUID victimId,
+                  String attackerName, UUID attackerId,
+                  List<Frame> victimFrames, List<Frame> attackerFrames) {
+            this.timestamp = timestamp;
+            this.victimName = victimName;
+            this.victimId = victimId;
+            this.attackerName = attackerName;
+            this.attackerId = attackerId;
+            this.victimFrames = victimFrames;
+            this.attackerFrames = attackerFrames;
+        }
+
+        int frameCount() {
+            return Math.max(victimFrames.size(), attackerFrames.size());
+        }
+    }
 
     static class ReplaySession {
-        BukkitTask task;
-        ArmorStand victimStand;
-        ArmorStand attackerStand;
-        GameMode prevMode;
-        Location prevLoc;
+        final BukkitTask task;
+        final ArmorStand victimStand, attackerStand;
+        final GameMode prevMode;
+        final Location prevLoc;
 
         ReplaySession(BukkitTask task, ArmorStand vs, ArmorStand as,
                       GameMode prevMode, Location prevLoc) {
@@ -96,13 +128,23 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         getCommand("replay").setTabCompleter(this);
 
         recordTask = new BukkitRunnable() {
-            @Override public void run() {
-                for (Player p : Bukkit.getOnlinePlayers()) recordFrame(p);
+            @Override
+            public void run() {
+                for (Player p : Bukkit.getOnlinePlayers()) {
+                    UUID id = p.getUniqueId();
+                    Deque<Frame> buf = buffers.computeIfAbsent(id, k -> new ArrayDeque<>());
+                    buf.addLast(new Frame(p));
+                    while (buf.size() > MAX_BUFFER) buf.pollFirst();
+                }
             }
-        }.runTaskTimer(this, 0L, RECORD_INTERVAL);
+        }.runTaskTimer(this, 0L, 1L);
 
         pruneTask = new BukkitRunnable() {
-            @Override public void run() { pruneOldHits(); }
+            @Override
+            public void run() {
+                long cutoff = System.currentTimeMillis() - MAX_HIT_AGE_MS;
+                allHits.removeIf(r -> r.timestamp < cutoff);
+            }
         }.runTaskTimer(this, PRUNE_INTERVAL, PRUNE_INTERVAL);
 
         getLogger().info("HitReplay enabled.");
@@ -122,63 +164,27 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         getLogger().info("HitReplay disabled.");
     }
 
-    private void recordFrame(Player p) {
-        UUID id = p.getUniqueId();
-        Location loc = p.getLocation();
-        bufData.computeIfAbsent(id, k -> new float[BUFFER_FRAMES * FS]);
-        bufHead.putIfAbsent(id, 0);
-        bufCount.putIfAbsent(id, 0);
-        float[] buf = bufData.get(id);
-        int head = bufHead.get(id);
-        int base = head * FS;
-        buf[base]     = (float) loc.getX();
-        buf[base + 1] = (float) loc.getY();
-        buf[base + 2] = (float) loc.getZ();
-        buf[base + 3] = loc.getYaw();
-        buf[base + 4] = loc.getPitch();
-        buf[base + 5] = (float) p.getHealth();
-        bufWorld.put(id, loc.getWorld().getName());
-        bufHead.put(id, (head + 1) % BUFFER_FRAMES);
-        int c = bufCount.get(id);
-        if (c < BUFFER_FRAMES) bufCount.put(id, c + 1);
-    }
-
-    private float[] snapshot(UUID id) {
-        float[] buf = bufData.get(id);
-        if (buf == null) return new float[0];
-        int head  = bufHead.get(id);
-        int count = bufCount.get(id);
-        if (count == 0) return new float[0];
-        float[] out = new float[count * FS];
-        int start = (head - count + BUFFER_FRAMES) % BUFFER_FRAMES;
-        for (int i = 0; i < count; i++)
-            System.arraycopy(buf, ((start + i) % BUFFER_FRAMES) * FS, out, i * FS, FS);
-        return out;
-    }
-
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onHit(EntityDamageByEntityEvent event) {
         if (!(event.getEntity() instanceof Player victim)) return;
         if (!(event.getDamager() instanceof Player attacker)) return;
-        float[] vf = snapshot(victim.getUniqueId());
-        float[] af = snapshot(attacker.getUniqueId());
-        int fc = Math.max(vf.length, af.length) / FS;
-        String world = bufWorld.getOrDefault(victim.getUniqueId(), victim.getWorld().getName());
+
+        Deque<Frame> vBuf = buffers.get(victim.getUniqueId());
+        Deque<Frame> aBuf = buffers.get(attacker.getUniqueId());
+
+        List<Frame> vFrames = vBuf != null ? new ArrayList<>(vBuf) : new ArrayList<>();
+        List<Frame> aFrames = aBuf != null ? new ArrayList<>(aBuf) : new ArrayList<>();
+
         allHits.add(0, new HitRecord(
             System.currentTimeMillis(),
             victim.getName(), victim.getUniqueId(),
             attacker.getName(), attacker.getUniqueId(),
-            vf, af, world, fc
+            vFrames, aFrames
         ));
-        getLogger().info("[HitReplay] Saved: " + victim.getName() + " hit by " + attacker.getName() + " — " + fc + " frames");
-    }
 
-    private void pruneOldHits() {
-        long cutoff = System.currentTimeMillis() - MAX_HIT_AGE_MS;
-        Iterator<HitRecord> it = allHits.iterator();
-        int n = 0;
-        while (it.hasNext()) { if (it.next().timestamp() < cutoff) { it.remove(); n++; } }
-        if (n > 0) getLogger().info("[HitReplay] Pruned " + n + " old records.");
+        getLogger().info("[HitReplay] Saved: " + victim.getName()
+                + " hit by " + attacker.getName()
+                + " — v:" + vFrames.size() + " a:" + aFrames.size() + " frames");
     }
 
     @Override
@@ -199,7 +205,7 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         if (args.length == 1) {
             Set<String> names = new HashSet<>();
             names.add("stop");
-            for (HitRecord r : allHits) { names.add(r.victimName()); names.add(r.attackerName()); }
+            for (HitRecord r : allHits) { names.add(r.victimName); names.add(r.attackerName); }
             return names.stream().filter(s -> s.toLowerCase().startsWith(args[0].toLowerCase())).toList();
         }
         return List.of();
@@ -208,7 +214,7 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
     private List<HitRecord> hitsFor(String name) {
         List<HitRecord> out = new ArrayList<>();
         for (HitRecord r : allHits)
-            if (r.victimName().equalsIgnoreCase(name) || r.attackerName().equalsIgnoreCase(name))
+            if (r.victimName.equalsIgnoreCase(name) || r.attackerName.equalsIgnoreCase(name))
                 out.add(r);
         return out;
     }
@@ -218,18 +224,18 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         Inventory inv = Bukkit.createInventory(null, size, Component.text("§6HitReplay — " + targetName));
         for (int i = 0; i < Math.min(hits.size(), size); i++) {
             HitRecord rec = hits.get(i);
-            boolean isVictim = rec.victimName().equalsIgnoreCase(targetName);
+            boolean isVictim = rec.victimName.equalsIgnoreCase(targetName);
             ItemStack item = new ItemStack(isVictim ? Material.RED_DYE : Material.LIME_DYE);
             ItemMeta meta = item.getItemMeta();
-            String time = FMT.format(new Date(rec.timestamp()));
-            String opponent = isVictim ? rec.attackerName() : rec.victimName();
+            String time = FMT.format(new Date(rec.timestamp));
+            String opponent = isVictim ? rec.attackerName : rec.victimName;
             int secs = rec.frameCount() / 20;
             meta.displayName(Component.text((isVictim ? "§cHit by §e" : "§aHit §e") + opponent + " §7at " + time));
             List<Component> lore = new ArrayList<>();
             lore.add(Component.text("§7Time: §f" + time));
             lore.add(Component.text("§7Duration: §f" + secs + "s"));
-            lore.add(Component.text("§7Victim: §c" + rec.victimName()));
-            lore.add(Component.text("§7Attacker: §e" + rec.attackerName()));
+            lore.add(Component.text("§7Victim: §c" + rec.victimName));
+            lore.add(Component.text("§7Attacker: §e" + rec.attackerName));
             lore.add(Component.text("§7Frames: §f" + rec.frameCount()));
             lore.add(Component.text(""));
             lore.add(Component.text("§eClick to watch"));
@@ -269,25 +275,19 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
     private void startReplay(Player viewer, HitRecord rec) {
         stopReplay(viewer, false);
 
-        org.bukkit.World world = Bukkit.getWorld(rec.worldName());
-        if (world == null) world = viewer.getWorld();
-
         int frameCount = rec.frameCount();
-        viewer.sendMessage("§6[HitReplay] §fLoading replay — §e" + frameCount + " frames");
+        viewer.sendMessage("§6[HitReplay] §fLoading — §e" + frameCount + " frames (" + (frameCount / 20) + "s)");
 
         if (frameCount == 0) {
             viewer.sendMessage("§cNo frames recorded.");
             return;
         }
 
-        float[] vf = rec.victimFrames();
-        Location startLoc = vf.length >= FS
-            ? new Location(world, vf[0], vf[1], vf[2], vf[3], vf[4])
-            : viewer.getLocation();
+        List<Frame> vFrames = rec.victimFrames;
+        Location startLoc = !vFrames.isEmpty() ? vFrames.get(0).toLocation() : viewer.getLocation();
 
-        final org.bukkit.World finalWorld = world;
-        ArmorStand victimStand   = spawnGhost(world, startLoc, "§c" + rec.victimName());
-        ArmorStand attackerStand = spawnGhost(world, startLoc, "§e" + rec.attackerName());
+        ArmorStand victimStand   = spawnGhost(startLoc, "§c" + rec.victimName);
+        ArmorStand attackerStand = spawnGhost(startLoc, "§e" + rec.attackerName);
 
         GameMode prevMode = viewer.getGameMode();
         Location prevLoc  = viewer.getLocation().clone();
@@ -296,46 +296,35 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
         viewer.teleport(startLoc.clone().add(0, 5, 0));
 
         int secs = frameCount / 20;
-        viewer.sendMessage("§6[HitReplay] §fPlaying §c" + rec.victimName()
-                + " §fvs §e" + rec.attackerName()
+        viewer.sendMessage("§6[HitReplay] §fWatching §c" + rec.victimName
+                + " §fvs §e" + rec.attackerName
                 + " §f(" + secs + "s) — fly freely — §e/replay stop §fto exit");
 
         final int[] frame = {0};
         final ArmorStand finalVS = victimStand;
         final ArmorStand finalAS = attackerStand;
+        final List<Frame> finalVF = rec.victimFrames;
+        final List<Frame> finalAF = rec.attackerFrames;
 
         BukkitTask task = new BukkitRunnable() {
             @Override
             public void run() {
                 if (!viewer.isOnline()) { finalVS.remove(); finalAS.remove(); cancel(); return; }
                 if (frame[0] >= frameCount) {
-                    viewer.sendMessage("§6[HitReplay] §fReplay finished. Type §e/replay stop §fto return.");
+                    viewer.sendMessage("§6[HitReplay] §fReplay finished. §e/replay stop §fto return.");
                     cancel();
                     return;
                 }
                 int fi = frame[0];
-                float[] victimFrames = rec.victimFrames();
-                if (fi * FS + FS <= victimFrames.length) {
-                    int b = fi * FS;
-                    finalVS.teleport(new Location(finalWorld,
-                            victimFrames[b], victimFrames[b+1], victimFrames[b+2],
-                            victimFrames[b+3], victimFrames[b+4]));
-                }
-                float[] attackerFrames = rec.attackerFrames();
-                if (fi * FS + FS <= attackerFrames.length) {
-                    int b = fi * FS;
-                    finalAS.teleport(new Location(finalWorld,
-                            attackerFrames[b], attackerFrames[b+1], attackerFrames[b+2],
-                            attackerFrames[b+3], attackerFrames[b+4]));
-                }
+                if (fi < finalVF.size()) finalVS.teleport(finalVF.get(fi).toLocation());
+                if (fi < finalAF.size()) finalAS.teleport(finalAF.get(fi).toLocation());
                 if (fi % 20 == 0) {
-                    float vHp = getHp(rec.victimFrames(), fi);
-                    float aHp = getHp(rec.attackerFrames(), fi);
-                    int elapsed = fi / 20;
+                    float vHp = fi < finalVF.size() ? finalVF.get(fi).health : 0;
+                    float aHp = fi < finalAF.size() ? finalAF.get(fi).health : 0;
                     viewer.sendActionBar(Component.text(
-                        "§c" + rec.victimName() + " §f" + String.format("%.1f", vHp) + "hp  " +
-                        "§e" + rec.attackerName() + " §f" + String.format("%.1f", aHp) + "hp  " +
-                        "§7[" + elapsed + "/" + secs + "s]"
+                        "§c" + rec.victimName + " §f" + String.format("%.1f", vHp) + "hp  "
+                        + "§e" + rec.attackerName + " §f" + String.format("%.1f", aHp) + "hp  "
+                        + "§7[" + (fi / 20) + "/" + secs + "s]"
                     ));
                 }
                 frame[0]++;
@@ -346,8 +335,8 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
                 new ReplaySession(task, victimStand, attackerStand, prevMode, prevLoc));
     }
 
-    private ArmorStand spawnGhost(org.bukkit.World world, Location loc, String name) {
-        return world.spawn(loc, ArmorStand.class, as -> {
+    private ArmorStand spawnGhost(Location loc, String name) {
+        return loc.getWorld().spawn(loc, ArmorStand.class, as -> {
             as.setVisible(true);
             as.setGravity(false);
             as.setInvulnerable(true);
@@ -358,11 +347,6 @@ public class HitReplay extends JavaPlugin implements Listener, CommandExecutor, 
             as.setCustomNameVisible(true);
             as.setGlowing(true);
         });
-    }
-
-    private float getHp(float[] frames, int fi) {
-        if (frames == null || fi * FS + FS > frames.length) return 0f;
-        return frames[fi * FS + 5];
     }
 
     private void stopReplay(Player viewer, boolean msg) {
